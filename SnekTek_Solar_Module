@@ -1,0 +1,328 @@
+/*
+ *
+ * SnekTek Solar Module
+ * REST API / JSON Monitoring
+ * http://snektekip/cur_data
+ * 
+ *
+ *  Copyright 2024 Anthony Uwadia
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ *  in compliance with the License. You may obtain a copy of the License at:
+ *  
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+ *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+ *  for the specific language governing permissions and limitations under the License.
+ *
+ */
+import hubitat.device.HubAction
+import hubitat.device.Protocol
+import groovy.json.JsonSlurper
+
+metadata {
+    definition (name: "SnekTek Solar Module", namespace: "elitexen", author: "Anthony Uwadia") {
+        capability "Sensor"
+        capability "Configuration"
+        capability "Initialize"
+        capability "Polling"
+		
+        capability "Illuminance Measurement"
+        capability "Energy Meter"
+        capability "Power Meter"
+        capability "Battery"
+        capability "VoltageMeasurement"
+        capability "Temperature Measurement"
+		
+        capability "PowerMeter"
+        capability "EnergyMeter"
+		
+        attribute "BatteryVolt", "number"
+        attribute "SolarVolt", "number"
+        attribute "BatteryAmp", "number"
+        attribute "SolarAmp", "number"
+        attribute "BatterySoC", "number"
+		attribute "SolarWatt", "number"
+		attribute "SolarWattToday", "number"
+        attribute "battery", "number"
+    }
+}
+
+preferences {
+    section("Status") {
+        input name: "pollingEnable", type: "bool", title: "Enable Polling", defaultValue: true
+    }
+    section("SnekTek Parameters") {
+        input "snIP", "text", title: "SnekTek IP Address", defaultValue: "192.168.123.15", required: true
+        input "snPath", "text", title: "REST Data Path", defaultValue: "cur_data", required: true
+        input "MaxWatts", "number", title: "Max Solar Watts", defaultValue: 0, required: true
+    }
+    section("Debugging") {
+        input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
+    }
+} 
+
+
+
+
+
+
+def logDebug(msg) {
+	if (logEnable) log.debug msg
+}
+
+def disableLogging() {
+    log.warn "debug logging disabled..."
+    device.updateSetting("logEnable", [value: "false", type: "bool"])
+}
+
+
+def trytounschedule() {
+    try {
+        unschedule()
+    } catch (e) {
+        log.error("caught exception", e)
+    }
+}
+
+def initMethods(String msg) {
+    log.debug "About to Init"
+    log.debug msg
+	
+    log.warn "debug logging is: ${logEnable == true}"
+    if (logEnable) runIn(1800, disableLogging)
+
+    trytounschedule()
+    clearState()
+
+	if (pollingEnable) runIn(10, poll)
+    log.debug "Done with Init"
+}
+
+
+def updated() {
+    initMethods("updated...")
+}
+
+def installed() {
+    initMethods("installed...")
+}
+
+def configure() {
+    initMethods("configured...")
+}
+
+def initialize() {
+    initMethods("initialized...")
+}
+
+def clearState() {
+    logDebug "Clearing State:"
+    for (entry in state) {
+        logDebug "$entry.key = $entry.value"
+        state[entry.key] = ""
+    }
+    state.clear()
+}
+
+def refresh() {
+    poll()
+}
+
+def poll() {
+	if (!pollingEnable) return
+	// void asynchttpGet(String callbackMethod, Map params, Map data = null)
+    logDebug "Executing 'poll'"
+    def params = [
+    
+        uri: "http://${settings.snIP}/${settings.snPath}",
+		contentType: 'application/json'
+	]
+    
+	asynchttpGet('parse', params)
+}
+
+
+def parse(response, data) {
+	
+    try {
+		logDebug "status of post call is: ${response.status}"
+		logDebug "response Data: \n ${response.data}\n"
+		
+		if (response.status == 200) {
+			processData response.data
+		}
+    } catch (Exception ex) {
+        logDebug "Error parsing data: ${ex}"
+    }
+	if (pollingEnable) runIn(10, poll)
+}
+
+def processData(data) {
+    
+	// Define friendly attribute names
+	def friendlyNames = [
+		"acLoadConToday": "AC Load Consumption Today",
+		"acLoadConTotal": "Total AC Load Consumption",
+		"bt.c": "BatteryAmp",
+		"bt.s": "BatterySoC",
+		"bt.t": "Battery Temp",
+		"bt.v": "BatteryVolt",
+		"btAcChgToday": "Battery AC Charge Today",
+		"btAcChgTotal": "Total Battery AC Charge",
+		"btDchgToday": "Battery Discharge Today",
+		"btDchgTotal": "Total Battery Discharge",
+		"controllerBrand": "Controller Brand",
+		"controllerModel": "Controller Model",
+		"controllerType": "Controller Type",
+		"dcLoadConToday": "DC Load Consumption Today",
+		"dcLoadConTotal": "Total DC Load Consumption",
+		"eq.sdintv": "Module Volt",
+		"eq.t": "Equipment Temp",
+		"firmwareVersion": "Firmware Version",
+		"pv.c": "SolarAmp",
+		"pv.p": "SolarWatt",
+		"pv.v": "SolarVolt",
+		"pvGenToday": "SolarWattToday",
+		"pvGenTotal": "Total Solar Generation",
+		"sn.ah": "Ambient Humidity",
+		"sn.ap": "Ambient Pressure",
+		"sn.at": "Ambient Temp",
+		"t": "Timestamp"
+	]
+
+	def alertValues = ["SolarWattToday","BatteryAmp","BatteryVolt","SolarAmp","SolarVolt","SolarWatt"]
+
+	// Parse JSON data
+	def slurper = new JsonSlurper()
+	def json = slurper.parseText(data)
+    
+	// Store parsed data with friendly attribute names in a Map
+	def results = [:]
+	friendlyNames.each { key, value ->
+		results[value] = json[key]
+	}
+	
+	logDebug "results = ${results}"
+	
+	results.each { name, value ->
+		if (state[name] != value) {
+			state[name] = value
+			if (alertValues.contains(name)) {
+				sendEvent(name: name, value: value)
+				logDebug "Value Updated: ${name}:${value}"
+			}
+			if (name == "SolarWatt") {
+				def battery = Math.round(value * 100 / MaxWatts)
+				sendEvent(name: "battery", value: battery)
+			}
+		}
+	}
+	
+	logDebug "Done processing the data"
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+	Sample Json:
+	{
+		"t":1708819330
+		,"controllerType":"renogy-rs232"
+		,"controllerModel":"model-placeholder"
+		,"controllerBrand":"brand-placeholder"
+		,"firmwareVersion":"6.1-3360eb-2023-03-07-03-57"
+		,"pv.v":19.2
+		,"pv.c":3.38
+		,"pv.p":65
+		,"bt.v":14.5
+		,"bt.s":100
+		,"bt.c":4.29
+		,"bt.t":25
+		,"eq.t":16
+		,"1d.c":0
+		,"1d.v":0
+		,"ld.p":0
+		,"sn.1":0
+		,"sn.ah":38.6
+		,"sn.ap":101.2666
+		,"sn.at":15.4
+		,"sn.l.m":0.1
+		," sn.ah.m":67.6
+		,"sn.ap.m":101.5633
+		,"sn.at.m":16.4
+		,"sn.l.mi":0
+		,"sn.ah.mi":28.3
+		,"sn.ap.mi":101.1806
+		,"sn.at.mi":8.4
+		,"pv.v.m":21.9
+		,"pv.c.m":30.28
+		,"pv.p.m":524
+		,"t.v.m":14.6
+		,"t.c.m":3 5.65
+		,"bt.t.m":25
+		,"eq.t.m":24
+		,"1d.c.m":0
+		,"1d.v.m":0
+		,"ld.p.m":0
+		,"pv.v.mi":15.1
+		,"pv.c.mi":0.22
+		,"pv.p.mi":5
+		,"bt.v.mi":13.3
+		,"bt.c.mi":0.33
+		,"bt.t.mi":25
+		,"eq.t.mi":10
+		,"ld.c.mi":0
+		,"ld.v .mi":0
+		,"1d.p.mi":0
+		,"eq.sdintv":3.426
+		,"pvGenToday":1.363
+		,"pvGenYesterday":4.294967e9
+		,"pvGenMonth":4.294967e9
+		,"pvGenYear":4.294967e9
+		,"pvGenTotal":1682.688
+		,"btAcChgToday":4.294967e9
+		,"btAcChgTotal":4.294967e9
+		,"btDchgToday":4.294967e9
+		,"btDchgTotal":4.294967e9
+		,"acLoadConToday":4.294967e9
+		,"acLoadConTotal":4.294967e9
+		,"dcLoadConToday":0
+		,"dcLoadConTotal":0.105
+	} 
+
+
+*/

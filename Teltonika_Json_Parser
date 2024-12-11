@@ -1,0 +1,689 @@
+/*
+    *  Teltonika Json Parser
+    *
+    *  Copyright 2024 Anthony Uwadia
+    *
+    *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+    *  in compliance with the License. You may obtain a copy of the License at:
+    *
+    *      http://www.apache.org/licenses/LICENSE-2.0
+    *
+    *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+    *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+    *  for the specific language governing permissions and limitations under the License.
+    *
+ */
+ 
+import hubitat.device.HubAction
+import hubitat.device.Protocol
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+
+
+metadata {
+    definition (name: "Teltonika Json Parser", namespace: "elitexen", author: "Anthony Uwadia") {
+        capability "Initialize"
+		
+        capability "Sensor"
+        capability "Configuration"
+
+        capability "Battery"
+        capability "VoltageMeasurement"
+		capability "TemperatureMeasurement"
+		capability "SignalStrength"        
+		
+        command "MarkAsHome"
+        command "UpdateHub"
+		
+		attribute "temperature", "number"
+        attribute "voltage", "number"
+        attribute "voltageStr", "text"
+        attribute "battery", "number"
+        attribute "Latitude", "number"
+        attribute "Longitude", "number"
+		attribute "GPS", "string"
+        attribute "rssi", "number"
+        attribute "lqi", "number"
+		attribute "PostCode", "string"
+		attribute "Timezone", "string"
+		attribute "WAN", "string"
+		
+    }
+}
+
+BigDecimal MinVolt() {
+	return 10.300;
+}
+
+BigDecimal MaxVolt() {
+	return 11.700;
+}
+
+
+
+preferences {
+    section("API Key") {
+        input "ApiKey", "text", title: "Google Maps API Key", required: true
+    }
+	section("Debugging") {
+        input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: false
+	}
+}
+
+
+
+
+def logDebug(msg) {
+	if (logEnable) log.debug msg
+}
+def logInfo(msg) {
+	if (logEnable) log.info msg
+}
+def logWarn(msg) {
+	if (logEnable) log.warn msg
+}
+def logErorr(title, err) {
+	if (logEnable) log.error(title, err)
+}
+
+def disableLogging() {
+    log.warn "debug logging disabled..."
+    device.updateSetting("logEnable", [value: "false", type: "bool"])
+}
+
+
+
+def configure() {
+	logDebug "Configuring"
+	clearState()
+}
+
+def initialize() {
+	logDebug "Initializing"
+	clearState()
+}
+
+def clearState() {
+    logDebug "Clearing State:"
+    for (entry in state) {
+        logDebug "State: $entry.key = $entry.value"
+        state[entry.key] = ""
+    }
+    
+    
+    def st = device.getCurrentStates()
+    log.debug st
+    for (entry in st) {
+        logDebug "curr State: $entry.name = $entry.value"
+        state.remove(entry.name)  
+        device.deleteCurrentState(entry.name)
+    }
+    
+    state.clear()
+    
+    logDebug "State Cleared!"
+}
+
+
+def parseNMEA(String nmea) {
+    Integer cnt = 0
+    // Map to store counts of each sentence type
+    Map<String, Integer> sentenceTypeCounts = new HashMap<>();
+    // logDebug "[Parsing NMEA:"
+    
+     // Split the input string into individual sentences
+    String[] sentences = nmea.split("\\r?\\n");
+
+    for (String sentence : sentences) {
+        if (!sentence.isEmpty() && sentence.contains(",")) {
+            // Extract the sentence type (e.g., GPGGA, GPRMC)
+            int typeEndIndex = sentence.indexOf(',');
+            String type = typeEndIndex > 0 ? sentence.substring(1, typeEndIndex) : sentence.substring(1);
+
+            // Increment the count for this sentence type
+            sentenceTypeCounts.put(type, sentenceTypeCounts.getOrDefault(type, 0) + 1);
+			
+            if (sentence.contains("GPGGA")) {
+                cnt += 1
+                String[] parts = sentence.split(",");
+                if (parts.length > 6) {
+                    String latitude = parts[2];
+                    String latitudeDir = parts[3];
+                    String longitude = parts[4];
+                    String longitudeDir = parts[5];
+                    String fixQuality = parts[6];
+                    
+                    if (!fixQuality.isEmpty()) {
+                        int fixQualityInt = Integer.parseInt(fixQuality);
+                        if (fixQualityInt > 0) {
+                            logDebug("Fix Quality: " + fixQualityInt);
+                            
+							if (!latitude.isEmpty()) {
+								logDebug("Latitude: " + latitude + " " + latitudeDir);
+								if (!(state["Latitude"]) || (state["Latitude"] != latitude)) {
+									state["Latitude"] = latitude
+									sendEvent(name: "Latitude", value: latitude)
+								} else {
+									latitude = ""
+								}
+							}
+							if (!longitude.isEmpty()) {
+								logDebug("Longitude: " + longitude + " " + longitudeDir);	
+								if (!(state["Longitude"]) || (state["Longitude"] != longitude)) {
+									state["Longitude"] = longitude
+									sendEvent(name: "Longitude", value: longitude)
+								} else {
+									longitude = ""
+								}
+							}
+                        }
+                    }
+                } else {
+                    // logDebug("Invalid GPGGA data.");
+                }
+            } else {
+                // logDebug("Unsupported NMEA sentence: " + sentence);
+            }
+        }
+    }
+    
+    // logDebug sentenceTypeCounts
+    // logDebug "Done Parsing NMEA $cnt]"
+}
+
+def parseData(String body) {
+    logDebug "[Parsing Data: "
+    //logDebug body
+    
+    try {
+		def jsd = parseJson(body)
+		def lqi = 0
+		def WAN = ""
+		def lat = ""
+		def lon = ""
+		def age = ""
+         
+		jsd.each { name, value ->    	
+            switch (name) {
+                case "Basic_Header":
+                    break;
+                case "LUA":
+                    break;
+                case "Data_Usage1":
+                    break;
+                case "Data_Usage2":
+                    break;
+                case "Data_Cellular":
+                    if (!value["connstate"].isEmpty()) {
+                        WAN = String.format("%s = %s",value["connstate"], value["operator"])
+		                if ((WAN) && (!state["WAN"]) || (state["WAN"] != WAN)) {
+			                state["WAN"] = WAN
+			                sendEvent(name: "WAN", value: WAN)
+		                }
+                    }
+                    break;
+                default:
+                    logDebug (String.format("Bad value: %s - %s (%s)", name, value, getObjectClassName(value)))
+                    break
+            }
+            
+		}
+		
+	} catch (e) {
+		logDebug ("Error Parsing Json") 
+		logDebug (body)
+		logDebug (e)
+	}
+    
+    
+    logDebug "Done parsing data]"
+}
+
+
+def otherStuff() {            
+	if (!(state[name]) || (state[name] != value)) {
+		try {
+			if (name == "system.voltage") {
+				state["voltage"] = Math.round(value * 1000) / 1000
+				state["voltageStr"] = String.format("%sV",state["voltage"])
+				
+				sendEvent(name: "voltage", value: state["voltage"])
+				sendEvent(name: "voltageStr", value: state["voltageStr"])
+				
+				def batt = 0
+				try {
+					if (value >= MaxVolt()) {
+						batt = 100
+					} else if (value <= MinVolt()) {
+						batt = 0
+					} else {
+						batt = Math.round(((value - MinVolt())/(MaxVolt() - MinVolt())*100))
+					}
+				} catch (e) {
+					batt = 0
+				}
+				state["battery"] = batt
+				sendEvent(name: "battery", value: batt)
+			} else if (name == "system.tempf") {
+				state["temperature"] = value
+				sendEvent(name: "temperature", value: value)				
+			} else if ((name.contains("signal_strength")) && (value.isNumber())) {
+				if (!lqi || value.toInteger() > lqi) {
+					lqi = value.toInteger()
+				}
+			} else if (["voltage","energy","power"].contains(name)) {
+				state[name] = value
+				sendEvent(name: name, value: value)
+				logDebug "Value Updated: ${name}:${value}"
+			} else if (name.contains("gps.l")) {
+				// Ignore latitude and Longitude values
+			} else if (["gps.age"].contains(name)) {
+				BigDecimal gpsval = value
+				
+				
+				if (gpsval > 0 && gpsval < 1) {
+					age = 1
+				} else {
+					age = Math.round(gpsval)
+				}
+				state["gps.age"] = age
+
+				try {
+					BigDecimal latd = jsd.get("gps.latitude.degree")
+					BigDecimal latm = jsd.get("gps.latitude.minute")
+					BigDecimal lats = jsd.get("gps.latitude.second")
+					
+					BigDecimal lond = jsd.get("gps.longitude.degree")
+					BigDecimal lonm = jsd.get("gps.longitude.minute")
+					BigDecimal lons = jsd.get("gps.longitude.second")
+					
+					if ((latd) && (latm) && (lats)) {
+						lat = Math.round((Math.abs(latd) + (latm / 60) + (lats / 3600)) * 1000000) / 1000000
+						if (latd < 0) {
+							lat = lat * -1
+						}
+						
+						// if (!(state["Latitude"]) || (state["Latitude"] != lat)) {
+							// state["Latitude"] = lat
+							// sendEvent(name: "Latitude", value: lat)
+						// } else {
+							// lat = ""
+						// }
+					}
+					if ((lond) && (lonm) && (lons)) {
+						lon = Math.round((Math.abs(lond) + (lonm / 60) + (lons / 3600)) * 1000000) / 1000000
+						if (lond < 0) {
+							lon = lon * -1
+						}
+						
+						// if (!(state["Longitude"]) || (state["Longitude"] != lon)) {
+							// state["Longitude"] = lon
+							// sendEvent(name: "Longitude", value: lon)
+						// } else {
+							// lon = ""
+						// }
+					}
+					
+					if ((age) && (lat) && (lon)) {
+						checkGPS(age, lat, lon)
+					}
+				} catch (e) {
+					logDebug "Issue parsing GPS"
+				}
+						
+			} else {
+				state["_" + name] = value
+			}
+		} catch (e) {
+			logDebug (String.format("Bad value: %s - %s (%s)", name, value, getObjectClassName(value)))
+		}
+	}
+	
+	
+	
+	WAN = jsd.get(jsd.get("system.device") + ".name")
+	if (!(WAN)) {
+		WAN = "Offline"
+	}
+	if ((WAN) && (!state["WAN"]) || (state["WAN"] != WAN)) {
+		state["WAN"] = WAN
+		sendEvent(name: "WAN", value: WAN)
+	}
+	
+
+	if (((!state["lqi"]) || (state["lqi"] != lqi))) {
+		state["lqi"] = lqi
+		sendEvent(name: "lqi", value: lqi)
+	}
+}
+
+
+def parse(String description) {
+    def msg = parseLanMessage(description)
+	def body = msg.body
+    def header = msg.header
+    
+    if (header.contains("nmea")) {
+        parseNMEA body 
+    } else if ((body.contains("{"))) {
+		parseData body
+	}
+	
+}
+
+
+def checkGPS(BigDecimal age, BigDecimal lat, BigDecimal lon) {
+	BigDecimal hubLat = location.getLatitude()
+	BigDecimal hubLon = location.getLongitude()
+	def hubZip = location.zipCode
+	def newZip = ""
+	def newTz = ""
+	
+	def sLat = state["Latitude"]
+	def sLon = state["Longitude"]
+	def sPC = state["PostCode"]
+	def sTz = state["Timezone"]
+	
+	BigDecimal wiggle = distanceInKM(lat, hubLat, lon, hubLon, 0, 0)
+	BigDecimal sWiggle = 9999
+
+	logDebug String.format("CheckGPS (Lat,Lon,age): %s, %s, %s", lat, lon, age)
+	logDebug String.format("State  (Lat,Lon,Post,Tz): %s, %s, %s, %s", sLat, sLon, sPC, sTz)
+	
+	try {
+		if ((wiggle > 10)) {
+			logDebug String.format("Hub wiggle: %s", wiggle)
+			
+			if ((sLat) && (sLon) && (sPC) && (sTz)) {
+				sWiggle = distanceInKM(sLat, lat, sLon, lon, 0, 0)
+				
+				if (sWiggle < 9999) {
+					logDebug String.format("State Wiggle %s, Old Zip %s, Lat %s, Lon %s, sLat %s, sLon %s", sWiggle, sPC, lat, lon, sLat, sLon)
+					newZip = sPC
+				} else {
+					logDebug String.format("State Wiggle Too Low %s", sWiggle)
+				}
+			} else {
+				logDebug String.format("Cannot Use State (Lat,Lon,Post,Tz) Variables for Zip Code: %s, %s, %s, %s", sLat, sLon, sPC, sTz)
+			}
+			
+			if (newZip)   {
+				newZip = gpsToPostCode(lat, lon)
+				newTz = gpsToTimezone(lat, lon)
+				
+				logDebug String.format("New Post Code: %s", newZip)
+				
+				
+				
+				state["Latitude"] = lat
+				state["Longitude"] = lon
+				state["PostCode"] = newZip
+				state["Timezone"] = newTz
+				
+				sendEvent(name: "Latitude", value: lat)
+				sendEvent(name: "Longitude", value: lon)
+				sendEvent(name: "PostCode", value: newZip)
+				sendEvent(name: "Timezone", value: newTz)
+				
+				
+				if ((lat) && (lon)) {
+					def GPS = String.format("%s,%s",lat,lon)
+					logDebug String.format("GPS State: %s", GPS)
+					if ((!state["gps"]) || (state["gps"] != GPS)) {
+						state["gps"] = GPS
+						sendEvent(name: "GPS", value: GPS)
+					} else {
+						GPS = ""
+					}
+				}
+				
+				runIn(5, updateHubLocation)
+			}
+		} else if (wiggle > 0) {
+			logDebug String.format("New GPS found, but not enough wiggle: %s km", wiggle)
+		}
+	} catch (e) {
+		logDebug String.format("Error in CheckGPS: %s",e)
+	}
+}
+
+
+def UpdateHub() {
+	updateHubLocation()
+}
+
+def updateHubLocation() {
+	def url = "127.0.0.1:8080"
+	
+	updateHubLocation(url)
+}
+
+def MarkAsHome() {
+	def lat = state["Latitude"]
+	def lon = state["Longitude"]
+	
+	if ((lat) && (lon)) {
+		def newZip = gpsToPostCode(lat, lon)
+		def newTz = gpsToTimezone(lat, lon)
+		
+		if ((newZip) && (newTz)) {
+			logDebug String.format("New Post Code: %s, Tz: %s", newZip, newTz)
+			
+			state["PostCode"] = newZip
+			state["Timezone"] = newTz
+			
+
+			sendEvent(name: "PostCode", value: newZip)
+			sendEvent(name: "Timezone", value: newTz)
+			
+			runIn(5, updateHubLocation)
+		} else {
+			logDebug "Cannot MarkAsHome missing NewZip or Tz"
+		}
+	} else {
+		logDebug "Cannot MarkAsHome missing lat or lon"
+	}		
+}
+
+
+def updateHubLocation(url) {
+	logDebug "Updating Hub Location"
+	
+	def newLat = state["Latitude"]
+	def newLon = state["Longitude"]
+	def newZip = state["PostCode"]
+	def newTz = state["Timezone"]
+	
+	def hubId = location.hub.id
+	def ip = String.format("http://%s/location/update", url)
+	def ip2 = String.format("http://%s/hub/details", url)
+	def hubName = location.hub.name
+	def hubTz = location.timeZone.ID
+	def hubTf = location.getTimeFormat()
+	def hubT = location.temperatureScale
+	def hubV = "Matthew"
+	
+	def postData = "name=${hubName}&timeZone=${newTz}&latitude=${newLat}&longitude=${newLon}&clock=${hubTf}&zipCode=${newZip}&temperatureScale=${hubT}&voice=${hubV}&mdnsName=${hubName}"
+	//def postData = String.format('{"id": %s,"name":"%s","version":1,"timeZone":"%s","latitude":"%s","longitude":"%s","clock":"%s","zipCode":"%s","temperatureScale":"%s","voice":"%s","mdnsName":"%s"}',hubId, hubName, newTz, newLat, newLon, hubTf, newZip, hubT, hubV, hubName)
+	logDebug "<Update postData:"
+	logDebug postData
+    logDebug ">"
+	try {
+        httpPost(ip, postData) { resp ->
+            if (resp.success) {
+                //logWarn "Call to ${url} success"
+				logDebug "Hub Location Successfully Updated!"
+            } else {
+                logWarn "Call to ${ip} failed"        
+            }
+        }
+    } catch (Exception e) {
+        logWarn "Call to ${ip} failed: ${e.message}"
+    }
+	
+	// curl -X POST tardisHub/location/update -H 'Content-Type: application/json' -d '{"id":1,"name":"tardisHUB","version":1,"timeZone":"US/Pacific","latitude":"50.881311","longitude":"-120.280000","clock":"12","zipCode":"V2B 8S2","temperatureScale":"F","voice":"Matthew"}'
+}
+
+
+def updateAlexa(devSN, devType, devAccID, cookieStr, custID) {
+	def newZip = state["PostCode"]
+	
+	def ip = String.format("http://%s/location/update", url)
+	
+	def json = String.format('{"id": %s,"name":"%s","version":1,"timeZone":"%s","latitude":"%s","longitude":"%s","clock":"%s","zipCode":"%s","temperatureScale":"%s","voice":"%s","mdnsName":"%s"}',hubId, hubName, newTz, newLat, newLon, hubTf, newZip, hubT, hubV, hubName)
+	
+	logDebug json
+	try {
+        httpPostJson(ip, json) { resp ->
+            if (resp.success) {
+                //logWarn "Call to ${url} success"
+				logDebug "Hub Location Successfully Updated!"
+            } else {
+                logWarn "Call to ${ip} failed"        
+            }
+        }
+    } catch (Exception e) {
+        logWarn "Call to ${ip} failed: ${e.message}"
+    }
+	
+	
+	
+
+		// curl 'https://alexa.amazon.com/api/device-preferences/G0911B0594160PGD' 
+			// -X 'PUT' 
+			// -H 'Accept: application/json, text/javascript, */*; q=0.01' 
+			// -H 'Accept-Language: en-US,en;q=0.9' 
+			// -H 'Cache-Control: no-cache' 
+			// -H 'Connection: keep-alive' 
+			// -H 'Content-Type: application/json' 
+			// -H 'Cookie: x-amzn-dat-gui-client-v=1.24.208819.0; ubid-main=135-5230613-9167718; aws-userInfo=%7B%22arn%22%3A%22arn%3Aaws%3Aiam%3A%3A023232651347%3Aroot%22%2C%22alias%22%3A%22%22%2C%22username%22%3A%22Anthony%2520Uwadia%22%2C%22keybase%22%3A%22Sb14ZjOpsnxI1NMphrTIxO4maOLYOFJwyTXeAq92zbU%5Cu003d%22%2C%22issuer%22%3A%22https%3A%2F%2Fwww.amazon.com%2Fap%2Fsignin%22%2C%22signinType%22%3A%22PUBLIC%22%7D; csrf=276134331; lc-main=en_US; s_lv=1625585369242; sid="DgH6nRkkREVkOEnW2cowkQ==|e2QYZbUj9uGmVLpAlrC2zxvSEDHfNovsMFYn24qSKag="; av-timezone=America/Los_Angeles; s_vnum=2069168869430%26vn%3D2; s_nr=1690935663554-Repeat; s_dslv=1690935663557; session-id-apay=137-9394337-0665049; session-id=141-7189766-9511631; AMCV_7742037254C95E840A4C98A6%40AdobeOrg=1585540135%7CMCIDTS%7C19609%7CvVersion%7C4.4.0; x-main="V1e4IRLHx@8?kGpfYsA89Ea0XGUPutjP"; at-main=Atza|IwEBII33Ao9gZ2LT0hQbrSH2FrP1p93bphSiYZn-VOZJVkZXDwZ5Mf-YNYS4EchVj4sk2ixeRo7nWugLoKLVzsyqZgjP6DpwsA_7zNDmtPh48CSHIX4qGe0MRErIntVTETxKEzVawG8blQvfQcBL9bB9BPAhZaR0Xg0aDFo8oy9b2aIB0p62yih2EYf-X5niEkZmbzdEcYVzijFfgbEHniWEIh96Lb1TqQpu5xUoEB_3SFTf3A; sess-at-main="NjOIN16gvdOehAoTDiTefBdNxtGQIaLDrY0+h5+7A98="; sst-main=Sst1|PQEo8egfri0uHJVOMeO3aCsQCZ4WqSESuN8PuOIF0zrs8t_CQYwYJMAO7m4g0GDJU0nM_zX6PbWiI0ibG1BkWBofKaxWMZRAftlKvG3QGsrjBRYv00iQ1xKCwdU1MhdAZXm5CgXmgj85EvAia-L_whgjanLaYouvfhU9Gp6O29nGtM-QmAD39AYBLyonc2tNvL-eXA70oab0cgLc39qnHKQDlBfdgfmFnNOr3Tl3xL-M2P8wqRW8NbY2Nuu7C59rbmhksf4tzHIUjQStVbehRDHhotIxZOuOWmVOFsNXwRlO-UA; session-id-time=2082787201l; i18n-prefs=USD; session-token=/E00Xj6WBbtYfuCDxmhTX8j+7VVyQm4UAcsRwGco5KWaXF3tld8D8Bl0NfUijVyUd5Y4OwRrYlk+knXbAWOjPwpDCY0ZBPOoWzmO4+YTln155XFU1k1Mb3TEJgitxzd+hQoyKFbGQe4D5QVidwRnRovY2+d2iH8aRgiB4hLSWMex18ockwjyc2kEttMLmIGegznmqFiQXJXpUP6ybyZew2JkI9+HxpLKReqKZGnwri4m+qTuyxtxBGHJzBXG/rOh2d0onuRAMxcVWgRW6vsrB3OvAreisfNt42ij9c5LA4futj+zIyVk58PyC7l4ogtRKXf3FPvnHr2RKpM1sRBHnZu6pl2Ze6kZmfcCX9hA/JmK2IBmxgWqdavGM24tFkeG' 
+			// -H 'DNT: 1' 
+			// -H 'Origin: https://alexa.amazon.com' 
+			// -H 'Pragma: no-cache' 
+			// -H 'Referer: https://alexa.amazon.com/spa/index.html' 
+			// -H 'Sec-Fetch-Dest: empty' 
+			// -H 'Sec-Fetch-Mode: cors' 
+			// -H 'Sec-Fetch-Site: same-origin' 
+			// -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Edg/117.0.2045.47' 
+			// -H 'X-Requested-With: XMLHttpRequest' 
+			// -H 'csrf: 276134331' 
+			// -H 'sec-ch-ua: "Microsoft Edge";v="117", "Not;A=Brand";v="8", "Chromium";v="117"' 
+			// -H 'sec-ch-ua-mobile: ?0' 
+			// -H 'sec-ch-ua-platform: "Windows"' 
+			// --data-raw '{"appDeviceList":[],"deviceAccountId":"A06632383623FM9IRC0QZ","deviceAddress":null,"deviceAddressModel":{"address1":null,"address2":null,"address3":null,"city":"GIFFORD","countryCode":"US","county":null,"postalCode":"99131","state":"WA","voice":null,"street":null,"label":"GIFFORD, WA 99131, US"},"deviceAddressSettingsVersion":3,"deviceSerialNumber":"G0911B0594160PGD","deviceType":"A4ZP7ZC4PI6TO","dialingPrefix":null,"distanceUnits":"IMPERIAL","firstRunCompleted":true,"goldfishEnabled":true,"locale":"en-us","notificationEarconEnabled":true,"overrideDeviceAddressValidation":true,"peonyEnabled":false,"postalCode":"99131","providerPreference":"BELL","responseStyle":"CONCISE","searchCustomerId":"A29Z6SJZF58WNW","supportedLocales":["en-US"],"temperatureScale":"FAHRENHEIT","timeZoneId":null,"timeZoneRegion":null,"voiceCastEnabled":null,"autocastToThisClient":false,"dialingPreference":"COBO","isSaveInFlight":true,"timezone":null}' 
+			// --compressed	
+	
+}
+
+
+
+
+
+
+
+
+
+/**
+ * Calculate distance between two points in latitude and longitude taking
+ * into account height difference. If you are not interested in height
+ * difference pass 0.0. Uses Haversine method as its base.
+ * 
+ * lat1, lon1 Start point lat2, lon2 End point el1 Start altitude in meters
+ * el2 End altitude in meters
+ * @returns Distance in Meters
+ */
+public BigDecimal distanceInMeters(BigDecimal lat1, BigDecimal lat2, BigDecimal lon1, BigDecimal lon2, BigDecimal el1, BigDecimal el2) {
+	BigDecimal ret = 0
+	
+	try {
+		final int R = 6371; // Radius of the earth
+
+		BigDecimal latDistance = Math.toRadians(lat2 - lat1);
+		BigDecimal lonDistance = Math.toRadians(lon2 - lon1);
+		BigDecimal a = Math.sin(latDistance / 2) * Math.sin(latDistance / 2) + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) * Math.sin(lonDistance / 2) * Math.sin(lonDistance / 2);
+		BigDecimal c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+		BigDecimal distance = R * c * 1000; // convert to meters
+
+		BigDecimal height = el1 - el2;
+
+		distance = Math.pow(distance, 2) + Math.pow(height, 2);
+		ret = Math.sqrt(distance)
+		ret = Math.round(ret)
+	} catch (e) {
+		logDebug String.format("Error in distanceInMeters: %s",e)
+	}
+	
+    return ret;
+}
+
+public BigDecimal distanceInKM(BigDecimal lat1, BigDecimal lat2, BigDecimal lon1, BigDecimal lon2, BigDecimal el1, BigDecimal el2) {
+	def ret = distanceInMeters(lat1, lat2, lon1, lon2, el1, el2);
+	
+	ret = Math.round(ret / 1000)
+	
+	return ret
+}
+
+
+public String gpsToTimezone(BigDecimal lat, BigDecimal lon) {
+	String ret;
+	//logInfo "GPS to Post Code Check Starting"
+	
+	String url = String.format("https://maps.googleapis.com/maps/api/timezone/json?timestamp=%s&key=%s&location=%s,%s", Math.round(now()/1000), settings.ApiKey, lat, lon)
+    
+    logWarn "Attempt to call ${url}"
+	try {
+        httpGet(url) { resp ->
+            if (resp.success && resp.data) {
+                //logWarn "Call to ${url} success"
+
+				logDebug resp.data
+				if (resp.data.timeZoneId) {
+					ret = resp.data.timeZoneId
+				}
+            } else {
+                logWarn "Call to ${url} failed"        
+            }
+        }
+    } catch (Exception e) {
+        logWarn "Call to ${url} failed: ${e.message}"
+    }
+	
+	//logInfo "GPS to Post Code Check Complete"
+	return ret;
+}
+
+
+public String gpsToPostCode(BigDecimal lat, BigDecimal lon) {
+	String ret;
+	//logInfo "GPS to Post Code Check Starting"
+	
+	String url = "https://maps.googleapis.com/maps/api/geocode/json?latlng=" + lat + "," + lon + "&result_type=postal_code&key=" + settings.ApiKey;
+    
+    logWarn "Attempt to call ${url}"
+	try {
+        httpGet(url) { resp ->
+            if (resp.success && resp.data) {
+                //logWarn "Call to ${url} success"
+				logDebug resp.data.results[0].address_components[0]
+				if (resp.data.results[0].address_components[0].types[0] == "postal_code") {
+					ret = resp.data.results[0].address_components[0].short_name.replaceAll("\\s","")
+				}
+            } else {
+                logWarn "Call to ${url} failed"        
+            }
+        }
+    } catch (Exception e) {
+        logWarn "Call to ${url} failed: ${e.message}"
+    }
+	
+	//logInfo "GPS to Post Code Check Complete"
+	return ret;
+}
+
+static boolean isNullOrEmpty(String str) { 
+    return (str == null || str.allWhitespace) 
+}
+
+
+

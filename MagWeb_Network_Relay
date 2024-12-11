@@ -1,0 +1,910 @@
+/*
+    *  MagWeb Local
+    *
+    *  Copyright 2020 Anthony Uwadia
+    *
+    *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+    *  in compliance with the License. You may obtain a copy of the License at:
+    *
+    *      http://www.apache.org/licenses/LICENSE-2.0
+    *
+    *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+    *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+    *  for the specific language governing permissions and limitations under the License.
+    *
+ */
+import hubitat.device.HubAction
+import hubitat.device.Protocol
+
+metadata {
+    definition (name: "MagWeb Network Relay", namespace: "elitexen", author: "Anthony Uwadia") {
+        capability "Sensor"
+        capability "Configuration"
+        capability "Initialize"
+
+        capability "Battery"
+        capability "PowerMeter"
+        capability "EnergyMeter"
+        capability "VoltageMeasurement"
+
+        attribute "voltage", "number"
+        // attribute "voltageStr", "text"
+        attribute "energy", "number"
+        attribute "power", "number"
+        attribute "battery", "number"
+		attribute "EnergyRate", "text"
+		// attribute "LastUpdate", "number"
+    }
+}
+
+preferences {
+    section("Status") {
+        input name: "pollingEnable", type: "bool", title: "Enable Polling", defaultValue: true
+    }
+    section("MagWeb Address") {
+        input "IP", "text", title: "IP Address", required: true
+        input "Port", "text", title: "Port", required: true
+    }
+    section("Debugging") {
+        input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: false
+    }
+}
+
+
+
+def logDebug(msg) {
+	if (logEnable) log.debug msg
+}
+def logInfo(msg) {
+	if (logEnable) log.info msg
+}
+def logError(title, err) {
+	if (logEnable) log.error(title, err)
+}
+
+def disableLogging() {
+    log.warn "debug logging disabled..."
+    device.updateSetting("logEnable", [value: "false", type: "bool"])
+}
+
+
+def tryToUnschedule() {
+    try {
+        unschedule()
+    } catch (e) {
+        logError("caught exception", e)
+    }
+}
+
+def initMethods(String msg) {
+    logInfo "About to Init"
+    logInfo msg
+
+    if (logEnable) runIn(1800, disableLogging)
+		
+    tryToUnschedule()
+    clearState()
+
+    if (pollingEnable) {        
+        tryToUnschedule()
+        connectMwLocal()
+    }
+    
+    runIn(300, pollingHeartbeat)
+    logInfo "Done with Init"
+}
+
+def pollingHeartbeat() {
+    log.info "Polling Heartbeat Executed"
+    runIn(60, pollingHeartbeat)
+
+    try {
+        if (pollingEnable) {        
+            tryToUnschedule()
+            connectMwLocal()
+        }
+    } catch (e) {
+        logError("MW Local connect failed initialize error", e)
+    }
+}
+
+def updated() {
+    initMethods("updated...")
+}
+
+def installed() {
+    initMethods("installed...")
+}
+
+def configure() {
+    initMethods("configured...")
+}
+
+def initialize() {
+    initMethods("initialized...")
+}
+
+def clearState() {
+    logDebug "Clearing State:"
+    for (entry in state) {
+        logDebug "State: $entry.key = $entry.value"
+        state[entry.key] = ""
+    }
+    
+    
+    def st = device.getCurrentStates()
+    for (entry in st) {
+        logDebug "curr State: $entry.name = $entry.value"
+        state.remove(entry.name)  
+        device.deleteCurrentState(entry.name)
+    }
+    
+    state.clear()
+    
+    logDebug "State Cleared!"
+}
+
+
+def refresh() {
+    poll()
+}
+
+def poll() {
+    if (pollingEnable) {        
+        logDebug "Scheduling MW"
+        tryToUnschedule()
+        connectMwLocal()
+    }
+    
+    logDebug "Executing 'poll'"
+    def message = " "
+    def ha = new HubAction(message
+        , Protocol.RAW_LAN
+        , [callback: "parserMagWebLan",
+         destinationAddress: "${settings.IP}:${settings.Port}",
+         type: HubAction.Type.LAN_TYPE_RAW,
+          encoding: HubAction.Encoding.HEX_STRING,
+          timeout: 45,])
+    logDebug "<tcp>${settings.IP}:${settings.Port}</tcp>"
+    logDebug "<hubaction>${ha}</hubaction>"
+    sendHubCommand(ha)
+
+    logDebug "Done with 'poll'"
+    logDebug " "
+}
+
+def parserMagWebLan(String message) {
+    logDebug "Parsing MW Lan'${message}'"
+}
+
+def scheduleMw() {
+    schedule("0/15 * * * * ? *", connectMwLocal)
+}
+
+
+def connectMwLocal() {
+    tryToUnschedule()
+
+    try {
+        //log.debug "Trying to connect"
+        //log.debug "<tcp>${settings.IP}:${settings.Port}</tcp>"
+        interfaces.rawSocket.connect(settings.IP, settings.Port.toInteger())
+        //log.error "connected"
+    } catch (e) {
+        logError("MW Local connect failed initialize error", e)
+        scheduleMw()
+    }
+}
+
+def closeSocket() {
+    interfaces.rawSocket.close()
+}
+
+def connectMwCloud(String message) {    
+    try {
+        //log.debug "Trying to connect"
+        //log.debug "<tcp>${settings.IP}:${settings.Port}</tcp>"
+        interfaces.rawSocket.connect("69.9.174.134", 4020, byteInterface: true)
+        interfaces.rawSocket.sendMessage(message)
+        runIn(1, closeSocket)
+        //log.error "connected"
+    } catch (e) {
+        logError("MW Cloud connect failed initialize error", e)
+    }
+}
+
+
+def parse(String message) {
+    closeSocket()
+    tryToUnschedule()
+
+    if (message.length() > 125) {
+        connectMwCloud(message)
+    }
+
+    scheduleMw()
+    parserMagWebLocal(message)
+
+    //log.warn "TCP Response is ${response}"
+   // def encrResponse = parseLanMessage(response)
+   // def cmdResponse = parseJson(inputXOR(encrResponse))
+   // log.warn "TCP Return message is ${cmdResponse}"
+}
+
+
+/* groovylint-disable-next-line MethodSize */
+def parserMagWebLocal(String msg) {
+    Map results = [:]
+    logDebug "Parsing MW Local ('${msg.length()}')"
+    logDebug "['${msg}']"
+
+/*
+        attribute "power", "number"
+        attribute "humidity", "number"
+        attribute "battery", "number"
+        attribute "SoC", "string"
+        attribute "voltstr", "string"
+        attribute "voltage", "number"
+*/
+    for (int i = 0; i < msg.length() - 1; i += 2) {
+        switch (i) {
+            case 40:
+                switch (msg[i..(i + 1)]) {
+                    case "00":
+                        results.put("InverterStatus", "Charger Standby - AC in, charging disabled")
+                        break
+                    case "01":
+                        results.put("InverterStatus", "EQMODE - unit is eq'ing with ac")
+                        break
+                    case "02":
+                        results.put("InverterStatus", "FLOATMODE - unit is float charging w/ac")
+                        break
+                    case "04":
+                        results.put("InverterStatus", "ABSORBMODE - unit is charging in absorb w/ ac")
+                        break
+                    case "08":
+                        results.put("InverterStatus", "BULKMODE - unit is charging in bulk mode with ac applied")
+                        break
+                    case "09":
+                        results.put("InverterStatus", "BATSAVERMODE - unit is charge mode but no charge current since bat is full")
+                        break
+                    case "10":
+                        results.put("InverterStatus", "CHARGEMODE - unit is in charge mode, no ac applied")
+                        break
+                    case "20":
+                        results.put("InverterStatus", "Off - inverter off, charger off waiting for user input (no AC pass through)")
+                        break
+                    case "40":
+                        results.put("InverterStatus", "INVERTMODE - inverter on (charger on or off)")
+                        break
+                    case "50":
+                        results.put("InverterStatus", "Inverter Standby - MS rev 4.0 or later only (PAE)")
+                        break
+                    case "80":
+                        results.put("InverterStatus", "SEARCHMODE - searching for load (charger on or off)")
+                        break
+                }
+                break
+            case 42:
+                switch (msg[i..(i + 1)]){
+                    case "00":
+                        results.put("InverterFault", "No Fault on inverter - not used")
+                        break
+                    case "01":
+                        results.put("InverterFault", "STUCKRELAY")
+                        break
+                    case "02":
+                        results.put("InverterFault", "DC_OVERLOAD - DC bridge overload fault")
+                        break
+                    case "03":
+                        results.put("InverterFault", "AC_OVERLOAD - AC output overload fault")
+                        break
+                    case "04":
+                        results.put("InverterFault", "DEAD BAT - charging a dead battery")
+                        break
+                    case "05":
+                        results.put("InverterFault", "BACKFEED - AC Backfeed")
+                        break
+                    case "08":
+                        results.put("InverterFault", "LOWBAT - low bat cutout")
+                        break
+                    case "09":
+                        results.put("InverterFault", "HIGHBAT - high bat cutout")
+                        break
+                    case "0A":
+                        results.put("InverterFault", "HIGHACVOLTS - high ac output voltage")
+                        break
+                    case "10":
+                        results.put("InverterFault", "BAD_BRIDGE - Remote displays = Internal Fault 1 = bad fet bridge")
+                        break
+                    case "12":
+                        results.put("InverterFault", "NTC_FAULT - Remote displays = Internal Fault 2 = fets too hot (>20C step)")
+                        break
+                    case "13":
+                        results.put("InverterFault", "FET_OVERLOAD - Remote displays = Fet Overload = FETS too hot too fast (6C over 4 sec)")
+                        break
+                    case "14":
+                        results.put("InverterFault", "INTERNAL_FAULT4 - Not used")
+                        break
+                    case "16":
+                        results.put("InverterFault", "STACKER_MODE_FAULT - Stacker fault, both units not in same mode, problem with other inverter")
+                        break
+                    case "18":
+                        results.put("InverterFault", "STACKER_CLK_PH_FAULT - Stacker sync clocks are not in phase")
+                        break
+                    case "17":
+                        results.put("InverterFault", "STACKER_NO_CLK_FAULT - Stacker does not detect other stackers sync clock")
+                        break
+                    case "19":
+                        results.put("InverterFault", "STACKER_PH_LOSS_FAULT - Stacker AC output voltage is not properly phased")
+                        break
+                    case "20":
+                        results.put("InverterFault", "OVERTEMP - overtemp shutdown")
+                        break
+                    case "21":
+                        results.put("InverterFault", "RELAY_FAULT - Transfer relay is not closed in chg mode")
+                        break
+                    case "80":
+                        results.put("InverterFault", "CHARGER_FAULT - Bridge fault in chg mode = max PWM, no ac amps, Vbat < FloatV")
+                        break
+                    case "81":
+                        results.put("InverterFault", "HIBATEMP - high battery temp")
+                        break
+                    case "90":
+                        results.put("InverterFault", "OPEN_SELCO_TCO - open transformer TCO temperature cutout")
+                        break
+                    case "91":
+                        results.put("InverterFault", "CB3 OPEN FAULT - open input 30 amp AC Breaker CB3")
+                        break
+                }
+                break
+            case 44:
+                results.put("InverterVoltsDC", Integer.parseInt(msg[i..(i + 3)], 16) / 10)
+                i += 2
+                break
+            case 48:
+                results.put("InverterAmpsDC", Integer.parseInt(msg[i..(i + 3)], 16))
+                results.put("power", results["InverterAmpsDC"] )
+                i += 2
+                break
+            case 52:
+                results.put("InverterVoltsOutAC", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 54:
+                results.put("InverterVoltsInAC", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 56:
+                if (msg[i..(i + 1)] == "00") {
+                    results.put("InverterLED", "Off")
+                } else {
+                    results.put("InverterLED", "On")
+                }
+                break
+            case 58:
+                if (msg[i..(i + 1)] == "00") {
+                    results.put("ChargerLED", "Off")
+                } else {
+                    results.put("ChargerLED", "On")
+                }
+                break
+            case 60:
+                results.put("InverterRevision", Integer.parseInt(msg[i..(i + 1)], 16) / 10)
+                break
+            case 62:
+                results.put("TempBattery", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 64:
+                results.put("TempTransformer", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 66:
+                results.put("TempFET", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 68:            
+                switch (msg[i..(i + 1)]){
+                    case "06":
+                        results.put("InverterModel", "MM612")
+                        break
+                    case "07":
+                        results.put("InverterModel", "MM612-AE")
+                        break
+                    case "08":
+                        results.put("InverterModel", "MM1212")
+                        break
+                    case "09":
+                        results.put("InverterModel", "MMS1012")
+                        break
+                    case "0A":
+                        results.put("InverterModel", "MM1012E")
+                        break
+                    case "0B":
+                        results.put("InverterModel", "MM1512")
+                        break
+                    case "0F":
+                        results.put("InverterModel", "ME1512")
+                        break
+                    case "14":
+                        results.put("InverterModel", "ME2012")
+                        break
+                    case "19":
+                        results.put("InverterModel", "ME2512")
+                        break
+                    case "1E":
+                        results.put("InverterModel", "ME3112")
+                        break
+                    case "23":
+                        results.put("InverterModel", "MS2012")
+                        break
+                    case "28":
+                        results.put("InverterModel", "MS2012E")
+                        break
+                    case "2D":
+                        results.put("InverterModel", "MS2812")
+                        break
+                    case "2F":
+                        results.put("InverterModel", "MS2712E")
+                        break
+                    case "35":
+                        results.put("InverterModel", "MM1324E")
+                        break
+                    case "36":
+                        results.put("InverterModel", "MM1524")
+                        break
+                    case "37":
+                        results.put("InverterModel", "RD1824")
+                        break
+                    case "3B":
+                        results.put("InverterModel", "RD2624E")
+                        break
+                    case "3C":
+                        results.put("InverterModel", "MM1x24E")
+                        break
+                    case "3F":
+                        results.put("InverterModel", "RD2824")
+                        break
+                    case "45":
+                        results.put("InverterModel", "RD4024E")
+                        break
+                    case "4A":
+                        results.put("InverterModel", "RD3924")
+                        break
+                    case "5A":
+                        results.put("InverterModel", "MS4124E")
+                        break
+                    case "5B":
+                        results.put("InverterModel", "MS2024")
+                        break
+                    case "69":
+                        results.put("InverterModel", "MS4024")
+                        break
+                    case "6A":
+                        results.put("InverterModel", "MS4024AE")
+                        break
+                    case "6B":
+                        results.put("InverterModel", "MS4024PAE")
+                        break
+                    case "6F":
+                        results.put("InverterModel", "MS4448AE")
+                        break
+                    case "70":
+                        results.put("InverterModel", "MS3748AEJ")
+                        break
+                    case "73":
+                        results.put("InverterModel", "MS4448PAE")
+                        break
+                    case "74":
+                        results.put("InverterModel", "MS3748PAEJ")
+                        break
+                }
+                break
+            case 70:
+            
+                switch (msg[i..(i + 1)]){
+                    case "00":
+                        results.put("StackMode", "Standalone unit")
+                        break
+                    case "01":
+                        results.put("StackMode", "Parallel stack - master")
+                        break
+                    case "02":
+                        results.put("StackMode", "Parallel stack - slave")
+                        break
+                    case "04":
+                        results.put("StackMode", "Series stack - master")
+                        break
+                    case "08":
+                        results.put("StackMode", "Series stack - slave")
+                        break
+                }
+                break
+                break
+            case 72:
+                results.put("InverterAmpsInAC", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 74:
+                results.put("InverterAmpsOutAC", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 76:
+                results.put("InverterHzAC", Integer.parseInt(msg[i..(i + 3)], 16) / 10)
+                i += 2
+                break
+
+
+
+
+            case 82:
+                results.put("RemoteInverterStatus", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 84:
+                results.put("SearchWatts", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 88:
+                switch (Integer.parseInt(msg[i..(i + 1)], 16)) {
+                    case 2:
+                        results.put("BatteryType", "Gel")
+                        break
+                    case 4:
+                        results.put("BatteryType", "Flooded")
+                        break
+                    case 8:
+                        results.put("BatteryType", "AGM")
+                        break
+                    case 10:
+                        results.put("BatteryType", "AGMv2")
+                        break
+                    default:
+                        results.put("BatteryType", "Custom")
+                        break
+                }
+                break
+            case 90:
+                results.put("ChargerAmps", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 92:
+                results.put("ShoreAmpsAC", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 94:
+                results.put("RemoteVersion", Integer.parseInt(msg[i..(i + 1)], 16) / 10)
+                break
+            case 96:
+                results.put("ParallelThreshold", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 98:
+                switch (Integer.parseInt(msg[i..(i + 1)], 16)) {
+                    case 1:
+                        results.put("AutoGenstart", "Off")
+                        break
+                    case 2:
+                        results.put("AutoGenstart", "Enabled")
+                        break
+                    case 3:
+                        results.put("AutoGenstart", "Test")
+                        break
+                    case 4:
+                        results.put("AutoGenstart", "Enabled with Quiet Time")
+                        break
+                    case 5:
+                        results.put("AutoGenstart", "On")
+                        break
+                }
+                break
+            case 100:
+                results.put("CutOutLowBatteryVolts", Integer.parseInt(msg[i..(i + 1)], 16) / 10)
+                break
+            case 102:
+                results.put("CutOutLowVoltAC", Math.round(30 * Math.exp(0.00625 * Integer.parseInt(msg[i..(i + 1)], 16))))
+                break
+            case 104:
+                results.put("ChargerFloatVolts", Integer.parseInt(msg[i..(i + 1)], 16) / 10)
+                break
+            case 106:
+                results.put("ChargerEqVolts", Integer.parseInt(msg[i..(i + 1)], 16) / 10)
+                break
+            case 108:
+                results.put("ChargerAbsorbTime", Integer.parseInt(msg[i..(i + 1)], 16) / 10)
+                break
+            case 110:
+                results.put("ChargerHours", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 112:
+                results.put("ChargerMin", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 114:
+                results.put("GenRunTime", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 116:
+                results.put("GenStartTemp", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 118:
+                results.put("GenStartVolt", Integer.parseInt(msg[i..(i + 1)], 16) / 10)
+                break
+            case 120:
+                results.put("GenQuietHours", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 182:
+                results.put("BatterySize", Integer.parseInt(msg[i..(i + 1)], 16) * 10)
+                break
+            case 208:
+                results.put("StateOfCharge", Integer.parseInt(msg[i..(i + 1)], 16))
+                results.put("battery", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+            case 210:
+                results.put("BatteryVolts", Integer.parseInt(msg[i..(i + 3)], 16) / 100)
+                results.put("voltage", results["BatteryVolts"])
+                results.put("voltageStr", results["BatteryVolts"] + 'V')
+                i += 2
+                break
+            case 214:
+                BigDecimal tmp = Integer.parseInt(msg[i..(i + 3)], 16)
+
+                if (tmp > (65536 / 2)) {
+                    tmp = tmp - 65536
+                }
+                tmp = tmp / 10
+                results.put("BatteryAmps", tmp)
+                results.put("energy", results["BatteryAmps"])
+                i += 2
+                break
+            case 218:
+                results.put("BatteryMinVolts", Integer.parseInt(msg[i..(i + 3)], 16) / 100)
+                i += 2
+                break
+            case 222:
+                results.put("BatteryMaxVolts", Integer.parseInt(msg[i..(i + 3)], 16) / 100)
+                i += 2
+                break
+            case 226:            
+                BigDecimal tmp = Integer.parseInt(msg[i..(i + 3)], 16)
+
+                if (tmp > (65536 / 2)) {
+                    tmp = tmp - 65536
+                }
+                results.put("BatteryAmpHourInOut", tmp)
+                i += 2
+                break
+            case 230:
+                results.put("BatteryAmpHourTrip", Integer.parseInt(msg[i..(i + 3)], 16) / 10)
+                i += 2
+                break
+            case 234:
+                results.put("BatteryAmpHourCumulative", Integer.parseInt(msg[i..(i + 3)], 16) / 10)
+                i += 2
+                break
+            case 238:
+                results.put("BatteryMonitorRevision", Integer.parseInt(msg[i..(i + 1)], 16) / 10)
+                break
+            case 240:
+                results.put("BatteryMonitorFault", Integer.parseInt(msg[i..(i + 1)], 16))
+                break
+        }
+    }
+	
+	def now = new Date().getTime()
+	BigDecimal Rate = 0
+    
+    try {
+        Rate = results["BatteryAmps"] / results["BatterySize"] * 100
+    } catch (Exception ex) {
+        Rate = 0
+    }
+	Rate = Math.round(Rate * 100) / 100
+	
+	results.put("EnergyRate", Rate + '% (' + results["BatteryAmps"] + 'A)')
+	results.put("LastUpdate", now)
+	
+    generateEvents(results)
+}
+
+
+def generateEvents(Map results) {
+    // log.debug "Parsed: ${results}"
+    results.each { name, value ->
+      if (state[name] != value) {
+        state[name] = value
+        if (["voltage","energy","power","EnergyRate","battery"].contains(name)) {
+            sendEvent(name: name, value: value)
+            logDebug "Value Updated: ${name}:${value}"
+        }
+    }
+  }
+  return null
+}
+
+
+
+
+
+
+
+
+
+def socketStatus(String message) {
+    if (message.contains("status: open")) {
+        logDebug "Connected"
+        return
+    } else if (message.contains("Stream closed")) {
+        logDebug "Connection Closed"
+        return
+    } else if (message.contains("Socket closed")) {
+        logDebug "Connection Closed"
+        return
+    } else if (message.contains("status: closing")) {
+        logDebug "Closing connection"
+        return
+    } else if (message.contains("failure:")) {
+        logDebug "Connection has failed with error [${message}]."
+    } else {
+        logDebug "Connection to has been lost due to an unknown error: ${message}"    
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tiles {
+    /*
+    valueTile("displayName", "device.displayName", width: 3, height: 1) {
+        state "val", label: '${currentValue}', action: 'poll'
+    }
+    */
+    //log.debug currentValue("SoC")
+
+    valueTile("SoC", "device.SoC", width: 3, height: 2, decoration: "flat") {
+        state ('val', label: '${currentValue}', backgroundColors:mapColor())
+    }
+    valueTile("voltage", "device.voltstr", width: 3, height: 1) {
+        state "val", label: '${currentValue}'
+    }
+
+    /*
+    standardTile("generator", "device.generator") {
+        state "off", label: "off", icon: "st.switches.switch.off", backgroundColor: "#ffffff", action: 'poll'
+        state "on", label: "on", icon: "st.switches.switch.on", backgroundColor: "#00a0dc", action: 'poll'
+    }
+    */
+    valueTile("status", "device.status", width: 3, height: 1) {
+        state "val", label: 'Status: ${currentValue}'
+    }
+    valueTile("fault", "device.fault", width: 3, height: 1) {
+        state "val", label: 'Faults: ${currentValue}'
+    }
+    valueTile("inverter", "device.inverter", width: 3, height: 1) {
+        state "val", label: 'Inverter: ${currentValue}'
+    }
+    valueTile("converter", "device.converter", width: 3, height: 1) {
+        state "val", label: 'Converter: ${currentValue}'
+    }
+    valueTile("tbattery", "device.tbattery", width: 3, height: 1) {
+        state "val", label: 'Battery: ${currentValue}'
+    }
+    valueTile("ttransformer", "device.ttransformer", width: 3, height: 1) {
+        state "val", label: 'Transformer: ${currentValue}'
+    }
+    valueTile("tfet", "device.tfet", width: 3, height: 1) {
+        state "val", label: 'FET: ${currentValue}'
+    }
+    valueTile("ags", "device.ags", width: 3, height: 1) {
+        state "val", label: 'AGS: ${currentValue}'
+    }
+    standardTile("age", "device.age", decoration: "flat") {
+        state "age", label: '${currentValue}', action: 'poll', icon:"st.secondary.refresh"
+    }
+
+    main('SoC')
+}
+
+def strState() {
+    def ret = "Almost!"
+    //= device.currentValue("SoC")
+       def me = state
+
+    //ret = me[0]
+
+    try {
+        ret = me.toMapString
+    } catch (ignored) {
+    }
+    logDebug "ME:" + me
+       //log.debug "Prop:" + me.getProperties()
+    logDebug "RET:" + ret
+
+
+    return ret
+}
+
+
+def mapColor(val) {
+    //log.debug "Coloring Val=" + val
+    def ret = [
+            [value: 25, color: "#bc2323"],
+            [value: 50, color: "#f1d801"],
+            [value: 75, color: "#1e9cbb"],
+            [value: 85, color: "#90d2a7"],
+            [value: 95, color: "#bc2323"],
+        ]
+
+    return ret
+}
+
+
+
+
+
+
+private sendTcpCmd(command) {
+    def message = tcpEncrypt(command)            //    See note in method tcpEncrypt
+    interfaces.rawSocket.connect(deviceIP, 9999,
+                                 byteInterface: true,
+                                 readDelay: 150,)
+    interfaces.rawSocket.sendMessage(message)
+    runIn(5, closeSocket)
+}
+
+
+def telnetStatus(String message) {
+    logDebug "TelNetStatus '${message}'"
+}
+
+def message(String message) {
+    logDebug "TcpStatus '${message}'"
+}
+
+
+
+//    Utility Methods
+private tcpEncrypt(command) {
+    def str = ""
+    def encrCmd = "000000" + Integer.toHexString(command.length())
+     def key = 0xAB
+    for (int i = 0; i < command.length(); i++) {
+        str = (command.charAt(i) as byte) ^ key
+        key = str
+        encrCmd += Integer.toHexString(str)
+    }
+    return encrCmd
+}
+private udpEncrypt(command) {
+    def str = ""
+    def encrCmd = ""
+     def key = 0xAB
+    for (int i = 0; i < command.length(); i++) {
+        str = (command.charAt(i) as byte) ^ key
+        key = str
+        encrCmd += Integer.toHexString(str)
+    }
+       return encrCmd
+}
+private inputXOR(encrResponse) {
+    String[] strBytes = encrResponse.split("(?<=\\G.{2})")
+    def cmdResponse = ""
+    def key = 0xAB
+    def nextKey
+    byte[] tmpXOR
+    for (int i = 0; i < strBytes.length; i++) {
+        nextKey = (byte)Integer.parseInt(strBytes[i], 16)    // could be negative
+        tmpXOR = nextKey ^ key
+        key = nextKey
+        cmdResponse += new String(tmpXOR)
+    }
+    return cmdResponse
+}
