@@ -49,9 +49,9 @@ metadata {
         
     }
 }
-static final BigDecimal MAX_VOLTAGE = 11.7
-static final BigDecimal MIN_VOLTAGE = 10.3
-static final BigDecimal GPS_AGE_MULTIPLIER = 60
+final BigDecimal MAX_VOLTAGE = 11.7
+final BigDecimal MIN_VOLTAGE = 10.3
+final BigDecimal GPS_AGE_MULTIPLIER = 60
 
 
 
