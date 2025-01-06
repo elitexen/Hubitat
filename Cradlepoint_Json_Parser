@@ -1,0 +1,439 @@
+/*
+    *  Cradlepoint Json Parser
+    *
+    *  Copyright 2025 Anthony Uwadia
+    *
+    *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+    *  in compliance with the License. You may obtain a copy of the License at:
+    *
+    *      http://www.apache.org/licenses/LICENSE-2.0
+    *
+    *  Unless required by applicable law or agreed to in writing, software distributed under the License is distributed
+    *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
+    *  for the specific language governing permissions and limitations under the License.
+    *
+ */
+ 
+import hubitat.device.HubAction
+import hubitat.device.Protocol
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+
+
+metadata {
+    definition (name: "Cradlepoint Json Parser", namespace: "elitexen", author: "Anthony Uwadia") {
+        capability "Initialize"
+        
+        capability "Sensor"
+        capability "Configuration"
+
+        capability "Battery"
+        capability "VoltageMeasurement"
+        capability "TemperatureMeasurement"
+        capability "SignalStrength"        
+        
+        command "UpdateHub", ["url"]
+        
+        attribute "temperature", "number"
+        attribute "voltage", "number"
+        attribute "voltageStr", "text"
+        attribute "battery", "number"
+        attribute "Latitude", "number"
+        attribute "Longitude", "number"
+        attribute "GPS", "string"
+        attribute "rssi", "number"
+        attribute "lqi", "number"
+        attribute "PostCode", "string"
+        attribute "Timezone", "string"
+        attribute "WAN", "string"
+        
+    }
+}
+static final BigDecimal MAX_VOLTAGE = 11.7
+static final BigDecimal MIN_VOLTAGE = 10.3
+static final BigDecimal GPS_AGE_MULTIPLIER = 60
+
+
+
+
+preferences {
+    section("API Key") {
+        input "ApiKey", "text", title: "Google Maps API Key", required: true
+    }
+}
+
+
+def configure() {
+    log.debug "Configuring"
+    clearState()
+}
+
+def initialize() {
+    log.debug "Initializing"
+    clearState()
+}
+
+def clearState() {
+    log.debug "Clearing State:"
+    for (entry in state) {
+        log.debug "$entry.key = $entry.value"
+        state[entry.key] = ""
+    }
+    state.clear()
+}
+
+def parse(String description) {
+    def msg = parseLanMessage(description)
+    def body = msg.body
+    
+    if (!(body.contains("{"))) {
+        return null
+    }
+    
+    state["LastUpdated"] = now()
+    
+    try {
+        def jsd = parseJson(body)
+        def lqi = 0
+        def WAN = ""
+        def lat = ""
+        def lon = ""
+        def age = ""
+        
+        jsd.each { name, value ->
+            if (!(value)) {
+                value = "-"
+            }
+            if  (state[name] != value)  {
+                try {
+                    if (name == "system.voltage") {
+                        state["voltage"] = Math.round(value * 100) / 100
+                        state["voltageStr"] = String.format("%sV",state["voltage"])
+                        
+                        sendEvent(name: "voltage", value: state["voltage"])
+                        sendEvent(name: "voltageStr", value: state["voltageStr"])
+                        
+                        def batt = 0
+                        try {
+                            if (value >= MAX_VOLTAGE) {
+                                batt = 100
+                            } else if (value <= MIN_VOLTAGE) {
+                                batt = 0
+                            } else {
+                                batt = Math.round(((value - MIN_VOLTAGE)/(MAX_VOLTAGE - MIN_VOLTAGE)*100))
+                            }
+                        } catch (e) {
+                            batt = 0
+                        }
+                        state["battery"] = batt
+                        sendEvent(name: "battery", value: batt)
+                    } else if (name == "system.temperature") {
+                        state["temperature"] = value
+                        sendEvent(name: "temperature", value: value)                
+                    } else if ((name.contains("signal_strength")) && (value.isNumber())) {
+                        if (!lqi || value.toInteger() > lqi) {
+                            lqi = value.toInteger()
+                        }
+                    } else if (["voltage","energy","power"].contains(name)) {
+                        state[name] = value
+                        sendEvent(name: name, value: value)
+                        log.debug "Value Updated: ${name}:${value}"
+                    } else if (name.contains("gps.l")) {
+                        // Ignore latitude and Longitude values
+                    } else if (["gps.age"].contains(name)) {
+                        BigDecimal gpsval = value
+                        
+                        age = Math.round(gpsval / 60 * 100) / 100
+                        state["gps.age"] = age
+
+                        try {
+                            lat = convertToDecimal(jsd.get("gps.latitude.degree"), jsd.get("gps.latitude.minute"), jsd.get("gps.latitude.second"))
+                            lon = convertToDecimal(jsd.get("gps.longitude.degree"), jsd.get("gps.longitude.minute"), jsd.get("gps.longitude.second"))
+
+                            if ((lat) && (state["Latitude"] != lat)) {
+                                state["Latitude"] = lat
+                                sendEvent(name: "Latitude", value: lat)
+                            } else {
+                                lat = ""
+                            }
+                            if ((lon) && (state["Longitude"] != lon)) {
+                                state["Longitude"] = lon
+                                sendEvent(name: "Longitude", value: lon)
+                            } else {
+                                lon = ""
+                            }
+                            
+                            if ((lat) && (lon)) {
+                                def GPS = String.format("%s,%s",lat,lon)
+                                if ((!state["gps"]) || (state["gps"] != GPS)) {
+                                    state["gps"] = GPS
+                                    sendEvent(name: "GPS", value: GPS)
+                                } else {
+                                    GPS = ""
+                                }
+                            }
+                                
+                            if ((age) && (lat) && (lon)) {
+                                checkGPS(age, lat, lon)
+                            }                            
+                        } catch (e) {
+                            log.debug "Issue parsing GPS"
+                        }
+                                
+                    } else {
+                        state[name] = value
+                    }
+                } catch (e) {
+                    log.debug (String.format("Bad value: %s - %s (%s)", name, value, getObjectClassName(value)))
+                }
+            }
+        }
+        
+        
+        
+        WAN = jsd.get(jsd.get("primary_device") + ".Name")
+        if (!(WAN)) {
+            WAN = "Offline"
+        }
+        if ((WAN) && (!state["WAN"]) || (state["WAN"] != WAN)) {
+            state["WAN"] = WAN
+            sendEvent(name: "WAN", value: WAN)
+        }
+        
+
+        if (((!state["lqi"]) || (state["lqi"] != lqi))) {
+            state["lqi"] = lqi
+            sendEvent(name: "lqi", value: lqi)
+        }
+        
+            
+        
+    } catch (e) {
+        log.debug ("Error Parsing Json") 
+        log.debug (body)
+        log.debug (e)
+    }
+}
+
+
+def checkGPS(BigDecimal age, BigDecimal lat, BigDecimal lon) {
+    BigDecimal hubLat = location.getLatitude()
+    BigDecimal hubLon = location.getLongitude()
+    def hubZip = location.zipCode
+    def newZip = ""
+    def newTz = ""
+    
+    BigDecimal wiggle = distanceInKM(lat, hubLat, lon, hubLon, 0, 0)
+    BigDecimal stateWiggle = 9999
+    
+    try {
+        if ((wiggle > 10)) {
+            log.debug String.format("Hub wiggle: %s", wiggle)
+            
+            if ((state["Latitude"]) && (state["Longitude"]) && (state["PostCode"]) && (state["Timezone"])) {
+                stateWiggle = distanceInKM(state["Latitude"], lat, state["Longitude"], lon, 0, 0)
+                
+                if (stateWiggle < 9999) {
+                    newZip = state["PostCode"]
+                } else {
+                log.debug String.format("State Wiggle Too Low %s", stateWiggle)
+                }
+            } else {
+                log.debug String.format("Cannot Use State (Lat,Lon,Post,Tz) Variables for Zip Code: %s, %s, %s, %s", state["Latitude"], state["Longitude"], state["PostCode"], state["Timezone"])
+            }
+            
+            if (!(newZip)) {
+                newZip = gpsToPostCode(lat, lon)
+                newTz = gpsToTimezone(lat, lon)
+                
+                log.debug String.format("New Post Code: %s", newZip)
+                
+                
+                
+                state["Latitude"] = lat
+                state["Longitude"] = lon
+                state["PostCode"] = newZip
+                state["Timezone"] = newTz
+                
+                sendEvent(name: "Latitude", value: lat)
+                sendEvent(name: "Longitude", value: lon)
+                sendEvent(name: "PostCode", value: newZip)
+                sendEvent(name: "Timezone", value: newTz)
+                
+                runIn(5, updateHubLocation)
+            }
+        } else if (wiggle > 0) {
+            log.debug String.format("New GPS found, but not enough wiggle: %s km", wiggle)
+        }
+    } catch (e) {
+        log.debug String.format("Error in CheckGPS: %s",e)
+    }
+}
+
+
+def UpdateHub(url) {
+    if (!(url)) {
+        updateHubLocation()
+    } else {
+        updateHubLocation(url)
+    }    
+}
+
+def updateHubLocation() {
+    def url = "127.0.0.1:8080"
+    
+    updateHubLocation(url)
+}
+
+
+def updateHubLocation(url) {
+    def newLat = state["Latitude"]
+    def newLon = state["Longitude"]
+    def newZip = state["PostCode"]
+    def newTz = state["Timezone"]
+    
+    def hubId = location.hub.id
+    def ip = String.format("http://%s/location/update", url)
+    def hubName = location.hub.name
+    def hubTz = location.timeZone.ID
+    def hubTf = location.getTimeFormat()
+    def hubT = location.temperatureScale
+    def hubV = "Matthew"
+    
+    def json = String.format('{"id": %s,"name":"%s","version":1,"timeZone":"%s","latitude":"%s","longitude":"%s","clock":"%s","zipCode":"%s","temperatureScale":"%s","voice":"%s","mdnsName":"%s"}',hubId, hubName, newTz, newLat, newLon, hubTf, newZip, hubT, hubV, hubName)
+    
+    log.debug json
+    try {
+        httpPostJson(ip, json) { resp ->
+            if (resp.success) {
+                //log.warn "Call to ${url} success"
+                log.debug "Hub Location Successfully Updated!"
+            } else {
+                log.warn "Call to ${ip} failed"        
+            }
+        }
+    } catch (Exception e) {
+        log.warn "Call to ${ip} failed: ${e.message}"
+    }
+    
+    // curl -X POST tardisHub/location/update -H 'Content-Type: application/json' -d '{"id":1,"name":"tardisHUB","version":1,"timeZone":"US/Pacific","latitude":"50.881311","longitude":"-120.280000","clock":"12","zipCode":"V2B 8S2","temperatureScale":"F","voice":"Matthew"}'
+}
+
+
+
+/**
+ * Calculate distance between two points in latitude and longitude taking
+ * into account height difference. If you are not interested in height
+ * difference pass 0.0. Uses Haversine method as its base.
+ * 
+ * lat1, lon1 Start point lat2, lon2 End point el1 Start altitude in meters
+ * el2 End altitude in meters
+ * @returns Distance in Meters
+ */
+public BigDecimal distanceInMeters(BigDecimal lat1, BigDecimal lat2, BigDecimal lon1, BigDecimal lon2, BigDecimal el1, BigDecimal el2) {
+    BigDecimal ret = 0
+    
+    try {
+        final int R = 6371; // Radius of the earth
+
+        BigDecimal latDistance = Math.toRadians(lat2 - lat1);
+        BigDecimal lonDistance = Math.toRadians(lon2 - lon1);
+        BigDecimal a = Math.sin(latDistance / 2) * Math.sin(latDistance / 2) + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) * Math.sin(lonDistance / 2) * Math.sin(lonDistance / 2);
+        BigDecimal c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        BigDecimal distance = R * c * 1000; // convert to meters
+
+        BigDecimal height = el1 - el2;
+
+        distance = Math.pow(distance, 2) + Math.pow(height, 2);
+        ret = Math.sqrt(distance)
+        ret = Math.round(ret)
+    } catch (e) {
+        log.debug String.format("Error in distanceInMeters: %s",e)
+    }
+    
+    return ret;
+}
+
+public BigDecimal distanceInKM(BigDecimal lat1, BigDecimal lat2, BigDecimal lon1, BigDecimal lon2, BigDecimal el1, BigDecimal el2) {
+    def ret = distanceInMeters(lat1, lat2, lon1, lon2, el1, el2);
+    
+    ret = Math.round(ret / 1000)
+    
+    return ret
+}
+
+
+public String gpsToTimezone(BigDecimal lat, BigDecimal lon) {
+    String ret;
+    //log.info "GPS to Post Code Check Starting"
+    
+    String url = String.format("https://maps.googleapis.com/maps/api/timezone/json?timestamp=%s&key=%s&location=%s,%s", Math.round(now()/1000), settings.ApiKey, lat, lon)
+    
+    log.warn "Attempt to call ${url}"
+    try {
+        httpGet(url) { resp ->
+            if (resp.success && resp.data) {
+                //log.warn "Call to ${url} success"
+
+                log.debug resp.data
+                if (resp.data.timeZoneId) {
+                    ret = resp.data.timeZoneId
+                }
+            } else {
+                log.warn "Call to ${url} failed"        
+            }
+        }
+    } catch (Exception e) {
+        log.warn "Call to ${url} failed: ${e.message}"
+    }
+    
+    //log.info "GPS to Post Code Check Complete"
+    return ret;
+}
+
+
+public String gpsToPostCode(BigDecimal lat, BigDecimal lon) {
+    String ret;
+    //log.info "GPS to Post Code Check Starting"
+    
+    String url = "https://maps.googleapis.com/maps/api/geocode/json?latlng=" + lat + "," + lon + "&result_type=postal_code&key=" + settings.ApiKey;
+    
+    log.warn "Attempt to call ${url}"
+    try {
+        httpGet(url) { resp ->
+            if (resp.success && resp.data) {
+                //log.warn "Call to ${url} success"
+                log.debug resp.data.results[0].address_components[0]
+                if (resp.data.results[0].address_components[0].types[0] == "postal_code") {
+                    ret = resp.data.results[0].address_components[0].short_name.replaceAll("\\s","")
+                }
+            } else {
+                log.warn "Call to ${url} failed"        
+            }
+        }
+    } catch (Exception e) {
+        log.warn "Call to ${url} failed: ${e.message}"
+    }
+    
+    //log.info "GPS to Post Code Check Complete"
+    return ret;
+}
+
+static boolean isNullOrEmpty(String str) { 
+    return (str == null || str.allWhitespace) 
+}
+
+
+
+def BigDecimal convertToDecimal(BigDecimal degree, BigDecimal minute, BigDecimal second) {
+    BigDecimal decimal = null
+
+    if (degree && minute && second) {
+        decimal = Math.round((Math.abs(degree) + (minute / 60) + (second / 3600)) * 1000000) / 1000000
+
+        if (degree < 0) {
+            decimal = decimal * -1
+        }
+    }
+    return decimal
+}
